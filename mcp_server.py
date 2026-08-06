@@ -375,10 +375,16 @@ def _send_to_telegram(video_path: str, chat_id: Optional[str] = None,
                     break
     if not token:
         return {"error": "TELEGRAM_BOT_TOKEN not found in env"}
+    # SECURITY: require explicit chat_id from the caller. Never silently fall back
+    # to TELEGRAM_HOME_CHANNEL — that would route videos to the wrong person if
+    # a remote MCP client forgets to specify the destination.
     if not chat_id:
-        chat_id = os.environ.get("TELEGRAM_HOME_CHANNEL")
-    if not chat_id:
-        return {"error": "chat_id required (or set TELEGRAM_HOME_CHANNEL)"}
+        return {
+            "error": "chat_id is required",
+            "help": "Pass the destination Telegram chat_id explicitly in the call. "
+                    "Do NOT rely on environment fallbacks — they leak videos to the "
+                    "server's owner. Example: {\"chat_id\": \"588090613\"}",
+        }
 
     p = Path(video_path)
     if not p.exists():
@@ -620,7 +626,7 @@ async def list_tools():
                 "type": "object",
                 "properties": {
                     "video_path": {"type": "string", "description": "Path to MP4 (from h3_get_output)"},
-                    "chat_id": {"type": "string", "description": "Telegram chat ID (e.g. '588090613'). Defaults to TELEGRAM_HOME_CHANNEL from env."},
+                    "chat_id": {"type": "string", "description": "REQUIRED: Destination Telegram chat ID (e.g. '588090613'). MUST be passed explicitly — no silent fallback to TELEGRAM_HOME_CHANNEL."},
                     "caption": {"type": "string", "default": "", "description": "Optional caption text"},
                     "reply_to_message_id": {"type": "integer", "description": "Optional message ID to reply to"},
                 },
