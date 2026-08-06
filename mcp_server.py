@@ -35,6 +35,7 @@ import asyncio
 import base64
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -94,6 +95,7 @@ class JobState:
         self.muxed_path: Optional[str] = None
         self.error: Optional[str] = None
         self.progress_log: list[tuple[float, str]] = []  # (ts, msg)
+        self.worker_proc: Any = None  # subprocess.Popen handle
 
     def elapsed(self) -> float:
         return (self.finished_at or time.time()) - self.started_at
@@ -162,104 +164,115 @@ class JobManager:
             return jobs
 
     def _run(self, job: JobState):
+        # Subprocess-based generation to avoid mmgp/PyTorch CUDA + threading deadlock on Windows.
+        # Writes progress to a JSON status file that JobManager polls.
         try:
-            _ensure_cwd()
             job.status = "loading"
-            job.progress_log.append((time.time(), "Loading H3 model + text encoder"))
+            job.progress_log.append((time.time(), "Spawning generation worker subprocess"))
 
-            import torch
-            free_gb = torch.cuda.mem_get_info()[0] / 1024**3 if torch.cuda.is_available() else 0
-            job.progress_log.append((time.time(), f"GPU: {torch.cuda.get_device_name(0)} ({free_gb:.1f} GB free)"))
+            # Write params to a temporary JSON file so the worker can read them reliably
+            params_file = OUT_DIR / f"job_{job.job_id}_params.json"
+            params_file.write_text(json.dumps(job.params), encoding="utf-8")
+            status_file = OUT_DIR / f"job_{job.job_id}_status.json"
+            status_file.write_text(json.dumps({"job_id": job.job_id, "status": "loading",
+                                                "started_at": time.time()}),
+                                    encoding="utf-8")
 
-            import wgp
-            from shared.utils import files_locator as fl
-            fl.set_checkpoints_paths([r"D:\Wan2GP-Models", "checkpoints", "."])
-            model_filename = fl.locate_file("MiniMax-H3-FL2VA-pruned_int8_convrot.safetensors")
-            _text_dir = fl.locate_folder("Qwen3-VL-32B-Instruct")
-            text_filename = os.path.join(_text_dir, "Qwen3-VL-32B-Instruct-layer50_quanto_bf16_int8.safetensors")
+            # Spawn worker subprocess
+            # PYTHONUNBUFFERED so we see progress live
+            worker_env = os.environ.copy()
+            worker_env["PYTHONUNBUFFERED"] = "1"
+            worker_env["HF_HOME"] = r"D:/Wan2GP-Models/.hf"
 
-            model_def = json.loads((REPO_ROOT / "defaults" / "minimax_h3_fl2va_pruned.json").read_text(encoding="utf-8"))
-            from models.minimax_h3.minimax_h3_handler import family_handler
-            handler = family_handler()
-            pipe_obj, modules = handler.load_model(
-                model_filename=model_filename,
-                model_type="minimax_h3_fl2va_pruned",
-                base_model_type="minimax_h3_fl2va_pruned",
-                model_def=model_def["model"],
-                quantizeTransformer=False,
-                VAE_dtype=torch.float32,
-                text_encoder_filename=text_filename,
+            # NOTE: Don't inherit PYTHONPATH/PYTHONHOME/UV_INTERNAL__PYTHONHOME — they
+            # confuse the worker into using a different venv
+            for k in ("PYTHONPATH", "PYTHONHOME", "UV_INTERNAL__PYTHONHOME"):
+                worker_env.pop(k, None)
+
+            cmd = [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "h3_worker.py"),
+                f"--status-file={status_file}",
+                f"--wan2gp-prompt={job.params['prompt']}",
+                f"--wan2gp-duration_seconds={job.params.get('duration_seconds', 3)}",
+                f"--wan2gp-seed={job.params.get('seed', -1)}",
+                f"--wan2gp-sampling_steps={job.params.get('sampling_steps', 16)}",
+            ]
+            if "height" in job.params:
+                cmd.append(f"--wan2gp-height={job.params['height']}")
+            if "width" in job.params:
+                cmd.append(f"--wan2gp-width={job.params['width']}")
+
+            log(f"  worker cmd: {' '.join(cmd[:5])}...")
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(REPO_ROOT),
+                env=worker_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
-            job.progress_log.append((time.time(), "Model loaded"))
+            job.worker_proc = proc
 
-            from mmgp import offload, profile_type
-            profile = getattr(profile_type, "VerylowRAM_LowVRAM", None) or 3
-            offload.profile(modules, profile_no=profile, quantizeTransformer=False,
-                            convertWeightsFloatTo=torch.bfloat16)
-            from shared.attention import get_default_attention_mode
-            offload.shared_state["_attention"] = get_default_attention_mode()
+            # Stream worker output AND poll status file in parallel via threads.
+            import threading
+            done_event = threading.Event()
 
-            if job.status == "cancelled":
-                job.finished_at = time.time()
-                return
+            def stdout_reader():
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    job.progress_log.append((time.time(), line))
+                    if len(job.progress_log) > 200:
+                        job.progress_log = job.progress_log[-200:]
+                    if job.status == "cancelled":
+                        proc.terminate()
+                        break
+                done_event.set()
 
-            job.status = "denoising"
-            prompt = job.params["prompt"]
-            job.progress_log.append((time.time(), f"Generating: {prompt[:100]}"))
+            def status_poller():
+                while not done_event.is_set():
+                    try:
+                        if status_file.exists():
+                            sf = json.loads(status_file.read_text(encoding="utf-8"))
+                            new_status = sf.get("status", job.status)
+                            if new_status != job.status and new_status in ("denoising", "saving", "done", "error"):
+                                job.status = new_status
+                            if "step" in sf:
+                                job.step = sf["step"]
+                    except Exception:
+                        pass
+                    done_event.wait(timeout=2)
 
-            def cb(*args, **kwargs):
-                if job.status == "cancelled":
-                    raise RuntimeError("Generation cancelled by user")
-                if args and isinstance(args[0], int):
-                    job.step = args[0] + 1
-                now = time.time()
-                if len(job.progress_log) == 0 or now - job.progress_log[-1][0] >= 30:
-                    job.progress_log.append((now, f"Step {job.step}/{job.total_steps}"))
+            reader_t = threading.Thread(target=stdout_reader, daemon=True)
+            poller_t = threading.Thread(target=status_poller, daemon=True)
+            reader_t.start()
+            poller_t.start()
 
-            result = pipe_obj.generate(
-                input_prompt=prompt,
-                height=job.params.get("height", 480),
-                width=job.params.get("width", 832),
-                frame_num=job.params.get("frame_num", 121),
-                sampling_steps=job.params.get("sampling_steps", 16),
-                shift=job.params.get("shift", 12.0),
-                seed=job.params.get("seed", -1),
-                fps=job.params.get("fps", 24),
-                callback=cb,
-            )
+            proc.wait(timeout=None)
+            done_event.set()
+            reader_t.join(timeout=5)
+            poller_t.join(timeout=5)
 
-            if job.status == "cancelled":
-                job.finished_at = time.time()
-                return
-
-            job.status = "saving"
-            job.progress_log.append((time.time(), "Encoding MP4 + WAV"))
-
-            import imageio.v2 as imageio, soundfile as sf, subprocess
-            vid = (result["x"].detach().clone().clamp_(-1, 1).add_(1).mul_(127.5)
-                   .clamp_(0, 255).to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy())
-            ts = int(time.time())
-            out_mp4 = OUT_DIR / f"h3_{job.job_id}_{ts}.mp4"
-            writer = imageio.get_writer(str(out_mp4), fps=24, codec="libx264", quality=8, macro_block_size=1)
-            for t in range(vid.shape[0]):
-                writer.append_data(vid[t])
-            writer.close()
-            job.video_path = str(out_mp4)
-
-            audio_path = OUT_DIR / f"h3_{job.job_id}_{ts}_audio.wav"
-            sf.write(str(audio_path), result["audio"], result["audio_sampling_rate"])
-            job.audio_path = str(audio_path)
-
-            muxed = OUT_DIR / f"h3_{job.job_id}_{ts}_with_audio.mp4"
-            subprocess.run([
-                "ffmpeg", "-y", "-i", str(out_mp4), "-i", str(audio_path),
-                "-c:v", "copy", "-c:a", "aac", "-shortest", str(muxed),
-            ], capture_output=True, text=True, timeout=120)
-            job.muxed_path = str(muxed)
-
-            job.status = "done"
+            # Read final status
+            if status_file.exists():
+                final = json.loads(status_file.read_text(encoding="utf-8"))
+                job.video_path = final.get("video_path")
+                job.audio_path = final.get("audio_path")
+                job.muxed_path = final.get("muxed_path")
+                if final.get("status") == "done":
+                    job.status = "done"
+                elif final.get("status") == "error":
+                    job.status = "error"
+                    job.error = final.get("error")
+                job.step = final.get("step", job.step)
+            else:
+                if job.status != "cancelled":
+                    job.status = "error"
+                    job.error = "worker died without writing status"
             job.finished_at = time.time()
-            job.progress_log.append((time.time(), f"OK: {muxed.name}"))
 
         except Exception as e:
             job.status = "error"
@@ -471,6 +484,11 @@ def _list_outputs(limit: int = 50) -> list[dict]:
             "modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
         })
     return out
+
+
+def log(msg):
+    """Server-side logging to stderr (MCP stdio keeps stdout for JSON-RPC)."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
