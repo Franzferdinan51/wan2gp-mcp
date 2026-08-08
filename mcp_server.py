@@ -722,6 +722,7 @@ async def call_tool(name: str, arguments: dict):
 
             params = {
                 "prompt": arguments["prompt"],
+                "duration_seconds": duration,
                 "frame_num": frame_num,
                 "height": arguments.get("height", 480),
                 "width": arguments.get("width", 832),
