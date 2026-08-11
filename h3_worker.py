@@ -46,11 +46,15 @@ def _extract_worker_args() -> tuple:
             if "=" in kv:
                 k, v = kv.split("=", 1)
                 v = v.strip('"').strip("'")
-                try:
-                    v = int(v)
-                except ValueError:
-                    pass
-                params[k] = v
+                # Repeatable list keys (image_path) accumulate into a list.
+                if k == "image_path":
+                    params.setdefault("image_paths", []).append(v)
+                else:
+                    try:
+                        v = int(v)
+                    except ValueError:
+                        pass
+                    params[k] = v
             i += 1
             continue
         # Anything else: pass through (wgp argparse will see it)
@@ -157,7 +161,12 @@ def main():
         update_status(status_path, status="denoising")
 
     t1 = time.time()
-    result = pipe_obj.generate(
+    # Optional image-to-video: pass image_start as a single reference frame.
+    # The MCP server passes image_paths as a list of absolute paths to character
+    # sheets or storyboards; we hand the first one as image_start (H3 supports
+    # up to 9 image refs in FL2VA mode).
+    image_paths = params.get("image_paths") or []
+    gen_kwargs = dict(
         input_prompt=params["prompt"],
         height=params.get("height", 480),
         width=params.get("width", 832),
@@ -168,6 +177,28 @@ def main():
         fps=24,
         callback=cb,
     )
+    if image_paths:
+        from PIL import Image
+        import torch as _torch
+        # H3 pipeline expects CTHW (4D) float tensors in [-1, 1].
+        def _pil_to_tensor(path):
+            img = Image.open(path).convert("RGB").resize(
+                (params.get("width", 832), params.get("height", 480)),
+                Image.LANCZOS,
+            )
+            arr = _torch.from_numpy(__import__("numpy").asarray(img)).float()
+            # (H, W, 3) -> (3, 1, H, W) CTHW with T=1.
+            arr = arr.permute(2, 0, 1).unsqueeze(1)
+            arr = (arr / 127.5) - 1.0
+            return arr
+
+        gen_kwargs["image_start"] = _pil_to_tensor(image_paths[0])
+        log(f"  I2V mode: using {image_paths[0]} as first frame (shape={tuple(gen_kwargs['image_start'].shape)})")
+        if len(image_paths) > 1:
+            gen_kwargs["image_refs"] = [_pil_to_tensor(p) for p in image_paths[1:10]]
+            log(f"  +{len(gen_kwargs['image_refs'])} additional reference images")
+
+    result = pipe_obj.generate(**gen_kwargs)
     log(f"  generation done in {time.time()-t1:.1f}s")
 
     if status_path:

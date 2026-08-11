@@ -202,6 +202,9 @@ class JobManager:
                 cmd.append(f"--wan2gp-height={job.params['height']}")
             if "width" in job.params:
                 cmd.append(f"--wan2gp-width={job.params['width']}")
+            # Pass image paths as a comma-separated list (worker splits on comma).
+            for p in job.params.get("image_paths") or []:
+                cmd.append(f"--wan2gp-image_path={p}")
 
             # Truncate the cmd preview — Windows stderr can choke on huge strings.
             preview = ' '.join(cmd[:3])
@@ -743,6 +746,15 @@ async def call_tool(name: str, arguments: dict):
             # 24 fps × duration
             frame_num = 121 if duration <= 5 else 362
 
+            # Optional image-to-video: list of absolute paths to character sheets
+            # or storyboards. The first becomes image_start, the rest become
+            # image_refs (up to 9 supported by FL2VA).
+            image_paths = arguments.get("image_paths") or []
+            for p in image_paths:
+                if not Path(p).exists():
+                    return [TextContent(type="text", text=json.dumps(
+                        {"error": f"image_paths entry does not exist: {p}"}))]
+
             params = {
                 "prompt": arguments["prompt"],
                 "duration_seconds": duration,
@@ -753,6 +765,7 @@ async def call_tool(name: str, arguments: dict):
                 "shift": 12.0,
                 "seed": arguments.get("seed", -1),
                 "fps": 24,
+                "image_paths": image_paths,
             }
             job = JOBS.submit(params)
             eta_minutes = 10 if frame_num == 121 else 55
