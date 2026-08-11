@@ -203,7 +203,11 @@ class JobManager:
             if "width" in job.params:
                 cmd.append(f"--wan2gp-width={job.params['width']}")
 
-            log(f"  worker cmd: {' '.join(cmd[:5])}...")
+            # Truncate the cmd preview — Windows stderr can choke on huge strings.
+            preview = ' '.join(cmd[:3])
+            if len(preview) > 200:
+                preview = preview[:200] + "..."
+            log(f"  worker cmd: {preview}")
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(REPO_ROOT),
@@ -493,8 +497,27 @@ def _list_outputs(limit: int = 50) -> list[dict]:
 
 
 def log(msg):
-    """Server-side logging to stderr (MCP stdio keeps stdout for JSON-RPC)."""
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+    """Server-side logging to stderr (MCP stdio keeps stdout for JSON-RPC).
+    Chunk long messages to avoid Windows EINVAL on large single writes."""
+    ts = f"[{time.strftime('%H:%M:%S')}] "
+    try:
+        # Windows stderr can EINVAL on single large writes. Chunk into 4 KB pieces.
+        full = ts + str(msg)
+        chunk = 4096
+        for i in range(0, len(full), chunk):
+            sys.stderr.write(full[i:i+chunk])
+            sys.stderr.flush()
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+    except Exception:
+        # Last-resort fallback: write to a sidecar log file so we never crash the
+        # server because logging failed.
+        try:
+            log_path = Path(os.environ.get("WAN2GP_LOG", r"C:/Users/franz/Wan2GP/wan2gp-mcp.log"))
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(ts + str(msg) + "\n")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
