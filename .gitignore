@@ -1,26 +1,3 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.egg-info/
-*.whl
-.venv/
-venv/
-.env
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Wan2GP runtime
-System.IO.FileStream
-*.log
-*.tmp
-
-# Generated outputs (don't commit user videos)
-tests/output/*.mp4
-tests/output/*.wav
+# Large reference images not for git
+references/episode_01/character_sheets/*.png
+references/episode_01/storyboards/*.png
