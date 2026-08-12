@@ -105,7 +105,19 @@ def main():
     import wgp
     from shared.utils import files_locator as fl
     fl.set_checkpoints_paths([r"D:\Wan2GP-Models", "checkpoints", "."])
-    model_filename = fl.locate_file("MiniMax-H3-FL2VA-pruned_int8_convrot.safetensors")
+
+    # Architecture selection: the MCP server picks based on whether
+    # image_paths were provided. Ref2VA is required for character
+    # consistency; FL2VA is fine for text-only generations.
+    arch = params.get("architecture") or "minimax_h3_fl2va_pruned"
+    if "ref2va" in arch:
+        model_short = "MiniMax-H3-Ref2VA-pruned_int8_convrot.safetensors"
+        config_short = "minimax_h3_ref2va_pruned.json"
+    else:
+        model_short = "MiniMax-H3-FL2VA-pruned_int8_convrot.safetensors"
+        config_short = "minimax_h3_fl2va_pruned.json"
+    log(f"  architecture: {arch}")
+    model_filename = fl.locate_file(model_short)
     _text_dir = fl.locate_folder("Qwen3-VL-32B-Instruct")
     text_filename = os.path.join(_text_dir, "Qwen3-VL-32B-Instruct-layer50_quanto_bf16_int8.safetensors")
 
@@ -113,7 +125,7 @@ def main():
     log(f"  text:  {text_filename} ({os.path.getsize(text_filename)/1e9:.1f} GB)")
 
     log("  loading handler...")
-    model_def = json.loads((REPO_ROOT / "defaults" / "minimax_h3_fl2va_pruned.json").read_text(encoding="utf-8"))
+    model_def = json.loads((REPO_ROOT / "defaults" / config_short).read_text(encoding="utf-8"))
     from models.minimax_h3.minimax_h3_handler import family_handler
     handler = family_handler()
 
@@ -121,8 +133,8 @@ def main():
     t0 = time.time()
     pipe_obj, modules = handler.load_model(
         model_filename=model_filename,
-        model_type="minimax_h3_fl2va_pruned",
-        base_model_type="minimax_h3_fl2va_pruned",
+        model_type=arch,
+        base_model_type=arch,
         model_def=model_def["model"],
         quantizeTransformer=False,
         VAE_dtype=torch.float32,

@@ -749,11 +749,27 @@ async def call_tool(name: str, arguments: dict):
             # Optional image-to-video: list of absolute paths to character sheets
             # or storyboards. The first becomes image_start, the rest become
             # image_refs (up to 9 supported by FL2VA).
+            #
+            # If any image_paths are passed, we default to **Ref2VA-pruned** —
+            # it treats references as guidance throughout the whole clip
+            # (FL2VA only anchors the FIRST frame and the character vanishes
+            # mid-clip). Callers can override via `model_architecture`.
             image_paths = arguments.get("image_paths") or []
             for p in image_paths:
                 if not Path(p).exists():
                     return [TextContent(type="text", text=json.dumps(
                         {"error": f"image_paths entry does not exist: {p}"}))]
+
+            # Architecture choice:
+            #   - default FL2VA for text-only generations
+            #   - Ref2VA-pruned for any I2V (multi-reference guidance)
+            #   - explicit override wins
+            if arguments.get("model_architecture"):
+                arch = arguments["model_architecture"]
+            elif image_paths:
+                arch = "minimax_h3_ref2va_pruned"
+            else:
+                arch = "minimax_h3_fl2va_pruned"
 
             params = {
                 "prompt": arguments["prompt"],
@@ -766,6 +782,7 @@ async def call_tool(name: str, arguments: dict):
                 "seed": arguments.get("seed", -1),
                 "fps": 24,
                 "image_paths": image_paths,
+                "architecture": arch,
             }
             job = JOBS.submit(params)
             eta_minutes = 10 if frame_num == 121 else 55
