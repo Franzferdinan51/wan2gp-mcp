@@ -70,6 +70,23 @@ async def healthz(request):
     return web.json_response({"ok": True, "service": "wan2gp-mcp-http", "tools": 14})
 
 
+async def list_tools(request):
+    """Return the actual MCP server tool list. Used for drift detection."""
+    try:
+        # core.list_tools() is the async function registered with @app.list_tools()
+        # It returns a list of Tool objects.
+        tools = await core.list_tools()
+        result = []
+        for t in tools:
+            result.append({
+                "name": t.name,
+                "description": (t.description or "")[:200],
+            })
+        return web.json_response({"ok": True, "count": len(result), "tools": result})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": f"{type(e).__name__}: {e}"}, status=500)
+
+
 async def serve_output(request):
     """
     GET /outputs/{filename} → returns the MP4 file directly.
@@ -101,7 +118,7 @@ code{background:#1a1a25;padding:2px 6px;border-radius:3px;color:#9ece6a}
 .method{color:#7dcfff;font-weight:bold}
 </style></head><body>
 <h1>Wan2GP MCP HTTP Bridge</h1>
-<p>REST front-end for the wan2gp MCP server. 14 tools, all POST JSON.</p>
+<p>REST front-end for the wan2gp MCP server. 14 tools.</p>
 <table>
 <tr><th>Endpoint</th><th>Purpose</th></tr>
 <tr><td><span class="method">POST</span> <code>/h3/status</code></td><td>Model + job state</td></tr>
@@ -119,6 +136,7 @@ code{background:#1a1a25;padding:2px 6px;border-radius:3px;color:#9ece6a}
 <tr><td><span class="method">POST</span> <code>/h3/list_outputs</code></td><td>List all MP4s on disk</td></tr>
 <tr><td><span class="method">POST</span> <code>/h3/get_default_settings</code></td><td>Return H3 params</td></tr>
 <tr><td><span class="method">GET</span> <code>/healthz</code></td><td>Liveness probe</td></tr>
+<tr><td><span class="method">GET</span> <code>/tools</code></td><td>List all MCP tools (drift detection)</td></tr>
 </table>
 <h2>Example</h2>
 <pre><code>curl -X POST http://localhost:9000/h3/list_outputs \\
@@ -135,6 +153,7 @@ def build_app():
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/healthz", healthz)
+    app.router.add_get("/tools", list_tools)
     app.router.add_get("/outputs/{filename}", serve_output)
     app.router.add_post("/h3/{tool}", call_handler)
     return app
